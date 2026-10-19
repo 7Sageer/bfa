@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" color="#171717" role="img" aria-labelledby="title">
+  <title id="title">bfa - Outside the Loop</title>
+  <path d="M24 12H12v40h12m16 0h12V36" fill="none" stroke="currentColor" stroke-width="6" stroke-linecap="square"/>
+  <circle cx="54" cy="16" r="4" fill="currentColor"/>
+</svg>
