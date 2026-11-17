@@ -2,27 +2,114 @@
 
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Readable } from 'node:stream';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-const defaultProgram = fileURLToPath(new URL('./bfa.bf', import.meta.url));
-import { decodeNumber, encodeFrame, encodeNumber, FrameReader } from './src/host/protocol.mjs';
-import { ensureBFInterpreter } from './src/host/toolchain.mjs';
+import { fileURLToPath } from 'node:url';
+
+const MAX_FRAME_LENGTH = 0xffffff;
+const IO_TIMEOUT = 120000;
+
+function encodeNumber(value) {
+  const encoded = Buffer.allocUnsafe(4);
+  for (let i = 3; i >= 0; i--) {
+    encoded[i] = value % 255 + 1;
+    value = Math.floor(value / 255);
+  }
+  return encoded;
+}
+
+function decodeNumber(bytes) {
+  let value = 0;
+  for (const byte of bytes) {
+    if (!Number.isInteger(byte) || byte < 1 || byte > 255) {
+      throw new Error('invalid byte in base-255 field');
+    }
+    value = value * 255 + byte - 1;
+  }
+  return value;
+}
+
+function checkFrameLength(length) {
+  if (!Number.isInteger(length) || length < 0 || length > MAX_FRAME_LENGTH) {
+    throw new Error(`frame payload exceeds the 24-bit BF length limit: ${length}`);
+  }
+}
+
+function encodeFrame(payload) {
+  checkFrameLength(payload.length);
+  return Buffer.concat([encodeNumber(payload.length), payload]);
+}
+
+class FrameReader {
+  constructor(onText = () => {}) {
+    this.onText = onText;
+    this.state = 'magic';
+  }
+
+  emitByte(byte) {
+    if (this.state === 'magic') {
+      if (byte === 255) {
+        this.state = 'op';
+      } else {
+        this.onText(byte);
+      }
+      return null;
+    }
+    if (this.state === 'op') {
+      this.op = byte;
+      this.lengthBytes = [];
+      this.state = 'length';
+      return null;
+    }
+    if (this.state === 'length') {
+      this.lengthBytes.push(byte);
+      if (this.lengthBytes.length < 4) {
+        return null;
+      }
+      const length = decodeNumber(this.lengthBytes);
+      checkFrameLength(length);
+      this.payload = Buffer.allocUnsafe(length);
+      this.offset = 0;
+      this.state = 'payload';
+      if (length > 0) {
+        return null;
+      }
+    } else {
+      this.payload[this.offset++] = byte;
+      if (this.offset < this.payload.length) {
+        return null;
+      }
+    }
+
+    const call = { op: this.op, payload: this.payload };
+    this.payload = null;
+    this.state = 'magic';
+    return call;
+  }
+
+  finish() {
+    if (this.state !== 'magic') {
+      throw new Error('Brainfuck program ended with an incomplete host frame');
+    }
+  }
+}
 
 function usage() {
   console.log(`Usage:
   bfa [program.bf] --config <agent.json>
   bfa [program.bf] --config <agent.json> --interactive
-  bfa <program.bf> --endpoint <url> --model <name> --prompt <text> --mcp <command>
+  bfa [program.bf] --endpoint <url> --model <name> --prompt <text> --mcp <command>
 
 The endpoint must accept OpenAI-compatible chat completions. The host transports
 opaque HTTP streaming. SSE parsing and MCP management run inside Brainfuck.
-Interactive commands are interpreted by BF. Use --interpreter <path> to run a
-compatible independent interpreter. A custom interpreter needs wrapping 8-bit
-cells, an expandable tape, and output flushed before reading input.
+Interactive commands are interpreted by BF. The default is bfopt on PATH via
+stdbuf -o0; set BFA_INTERPRETER or use --interpreter to select another one.
+A custom interpreter needs wrapping 8-bit cells, an expandable tape, and
+output flushed before reading input.
 CLI values override the configuration file.`);
 }
+
+const isStringArray = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
 
 function normalizeMcp(value) {
   const servers = Array.isArray(value) ? value : [value];
@@ -33,9 +120,7 @@ function normalizeMcp(value) {
     if (server && typeof server.command === 'string') {
       const args = server.args ?? [];
       const tools = server.tools ?? null;
-      const validArgs = Array.isArray(args) && args.every((arg) => typeof arg === 'string');
-      const validTools = tools === null || (Array.isArray(tools) && tools.every((tool) => typeof tool === 'string'));
-      if (validArgs && validTools) {
+      if (isStringArray(args) && (tools === null || isStringArray(tools))) {
         return { command: server.command, args, shell: false, tools };
       }
     }
@@ -44,7 +129,7 @@ function normalizeMcp(value) {
 }
 
 function parseArgs(argv) {
-  const cli = { program: null, config: null, endpoint: null, model: null, prompt: null, mcp: null, interpreter: null, interactive: false };
+  const cli = { program: null, interactive: false };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '-h' || arg === '--help') {
@@ -79,7 +164,7 @@ function parseArgs(argv) {
   const provider = config.provider ?? {};
   const interactive = cli.interactive || config.interactive === true;
   const options = {
-    program: cli.program ?? defaultProgram,
+    program: cli.program ?? fileURLToPath(new URL('./bfa.bf', import.meta.url)),
     endpoint: cli.endpoint ?? provider.endpoint ?? null,
     model: cli.model ?? provider.model ?? null,
     prompt: cli.prompt ?? config.prompt ?? (interactive ? '' : null),
@@ -87,7 +172,7 @@ function parseArgs(argv) {
     apiKey: provider.apiKey ?? null,
     apiKeyEnv: provider.apiKeyEnv ?? null,
     interactive,
-    interpreter: cli.interpreter,
+    interpreter: cli.interpreter ?? process.env.BFA_INTERPRETER ?? 'bfopt',
   };
   for (const key of ['program', 'endpoint', 'model', 'prompt', 'mcp']) {
     if (!options[key] && !(key === 'prompt' && options.interactive)) {
@@ -108,12 +193,9 @@ function parseArgs(argv) {
   return options;
 }
 
-// Paused readable streams provide bounded, demand-driven byte transport. The
-// host never splits MCP lines, parses completions, or retains agent history.
-export class ByteChannel {
-  constructor(readable, timeout = 120000) {
+class ByteChannel {
+  constructor(readable) {
     this.readable = readable;
-    this.timeout = timeout;
     this.error = null;
     readable.on('error', (error) => { this.error = error; });
   }
@@ -124,7 +206,6 @@ export class ByteChannel {
       if (this.error) throw this.error;
       const data = stream.read(Math.min(maximum, stream.readableLength) || undefined);
       if (data !== null) {
-        // read() without a size can return a chunk larger than the requested cap.
         if (data.length > maximum) stream.unshift(data.subarray(maximum));
         return Buffer.concat([Buffer.from([0]), data.subarray(0, maximum)]);
       }
@@ -132,39 +213,31 @@ export class ByteChannel {
       await new Promise((resolveRead, reject) => {
         const finish = (error) => {
           clearTimeout(timer);
-          stream.off('readable', ready);
-          stream.off('end', ready);
-          stream.off('close', ready);
+          for (const event of ['readable', 'end', 'close']) stream.off(event, ready);
           stream.off('error', failed);
           error ? reject(error) : resolveRead();
         };
         const ready = () => finish();
         const failed = (error) => finish(error);
-        const timer = setTimeout(() => finish(new Error('byte read timed out')), this.timeout);
-        stream.once('readable', ready);
-        stream.once('end', ready);
-        stream.once('close', ready);
+        const timer = setTimeout(() => finish(new Error('byte read timed out')), IO_TIMEOUT);
+        for (const event of ['readable', 'end', 'close']) stream.once(event, ready);
         stream.once('error', failed);
       });
     }
   }
 }
 
-export class Host {
+class Host {
   constructor(options) {
     this.options = options;
-    this.endpoint = options.endpoint;
     this.processes = new Map();
     this.http = null;
     this.controller = null;
     this.exitCode = null;
     this.readline = null;
     this.lines = null;
-    this.timeout = options.timeout ?? 120000;
-    this.frames = new FrameReader((byte) => process.stdout.write(Buffer.from([byte])));
+    this.frames = new FrameReader();
   }
-
-  emitByte(byte) { return this.frames.emitByte(byte); }
 
   process(handle) {
     if (!Number.isInteger(handle) || handle < 1 || handle > this.options.mcp.length) {
@@ -172,10 +245,10 @@ export class Host {
     }
     if (!this.processes.has(handle)) {
       const config = this.options.mcp[handle - 1];
-      const child = spawn(config.command, config.args ?? [], {
-        shell: config.shell ?? false, stdio: ['pipe', 'pipe', 'inherit'],
+      const child = spawn(config.command, config.args, {
+        shell: config.shell, stdio: ['pipe', 'pipe', 'inherit'],
       });
-      const channel = new ByteChannel(child.stdout, this.timeout);
+      const channel = new ByteChannel(child.stdout);
       child.on('error', (error) => { channel.error = error; child.stdout.destroy(error); });
       child.stdin.on('error', (error) => { channel.error = error; });
       this.processes.set(handle, { child, channel });
@@ -202,7 +275,7 @@ export class Host {
     const size = decodeNumber(payload.subarray(0, 4));
     if (size > payload.length - 4) throw new Error('truncated HTTP descriptor');
     const descriptor = JSON.parse(payload.subarray(4, 4 + size).toString('utf8'));
-    if (descriptor.url !== this.endpoint) throw new Error('HTTP target outside configured capability');
+    if (descriptor.url !== this.options.endpoint) throw new Error('HTTP target outside configured capability');
     const headers = new Headers(descriptor.headers);
     const token = this.options.apiKey ?? (this.options.apiKeyEnv
       ? process.env[this.options.apiKeyEnv] : process.env.HF_TOKEN || process.env.OPENAI_API_KEY);
@@ -211,14 +284,14 @@ export class Host {
     }
     if (token) headers.set('authorization', `Bearer ${token}`);
     this.controller = new AbortController();
-    const timer = setTimeout(() => this.controller?.abort(), this.timeout);
+    const timer = setTimeout(() => this.controller?.abort(), IO_TIMEOUT);
     try {
       const response = await fetch(descriptor.url, {
         method: descriptor.method, headers, body: payload.subarray(4 + size),
         signal: this.controller.signal, redirect: 'error',
       });
       const readable = response.body ? Readable.fromWeb(response.body) : Readable.from([]);
-      this.http = new ByteChannel(readable, this.timeout);
+      this.http = new ByteChannel(readable);
       return Buffer.concat([encodeNumber(response.status), Buffer.from(response.headers.get('content-type') || '')]);
     } finally {
       clearTimeout(timer);
@@ -238,7 +311,7 @@ export class Host {
     }
     if (op === 1) {
       const o = this.options;
-      const servers = o.mcp.map((server) => ({ tools: server.tools ?? null }));
+      const servers = o.mcp.map((server) => ({ tools: server.tools }));
       return Buffer.from(`${o.endpoint}\n${o.model}\n${o.prompt}\n${o.interactive ? 1 : 0}\n${JSON.stringify(servers)}`);
     }
     if (op === 2) {
@@ -261,7 +334,7 @@ export class Host {
       if (op === 3) {
         const { child } = this.process(handle);
         await new Promise((resolveWrite, reject) => {
-          const timer = setTimeout(() => reject(new Error('byte write timed out')), this.timeout);
+          const timer = setTimeout(() => reject(new Error('byte write timed out')), IO_TIMEOUT);
           child.stdin.write(payload.subarray(4), (error) => {
             clearTimeout(timer);
             error ? reject(error) : resolveWrite();
@@ -294,23 +367,21 @@ export class Host {
 }
 
 function writeFrame(child, payload) {
-  const frame = encodeFrame(payload);
   return new Promise((resolveWrite, reject) => {
-    child.stdin.write(frame, (error) => error ? reject(error) : resolveWrite());
+    child.stdin.write(encodeFrame(payload), (error) => error ? reject(error) : resolveWrite());
   });
 }
 
-export async function runProgram(child, host) {
+async function runProgram(child, host) {
   let requests = Promise.resolve();
   let failure = null;
   let text = [];
-  const output = host.frames.onText;
   host.frames.onText = (byte) => text.push(byte);
   const flushText = () => {
     if (!text.length) return;
     const bytes = text;
     text = [];
-    requests = requests.then(() => { for (const byte of bytes) output(byte); }).catch(fail);
+    requests = requests.then(() => process.stdout.write(Buffer.from(bytes))).catch(fail);
   };
   const fail = (error) => {
     failure ??= error;
@@ -321,7 +392,7 @@ export async function runProgram(child, host) {
   child.stdout.on('data', (chunk) => {
     try {
       for (const byte of chunk) {
-        const call = host.emitByte(byte);
+        const call = host.frames.emitByte(byte);
         if (call) {
           flushText();
           requests = requests
@@ -349,19 +420,20 @@ export async function runProgram(child, host) {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  let host;
-  let child;
-  try {
-    const options = parseArgs(process.argv.slice(2));
-    child = spawn(options.interpreter || ensureBFInterpreter(), [options.program], { stdio: ['pipe', 'pipe', 'inherit'] });
-    host = new Host(options);
-    await runProgram(child, host);
-  } catch (error) {
-    console.error(`bfa: ${error.message}`);
-    process.exitCode = 1;
-    child?.kill();
-  } finally {
-    host?.close();
-  }
+let host;
+let child;
+try {
+  const options = parseArgs(process.argv.slice(2));
+  const useStdbuf = options.interpreter === 'bfopt';
+  child = spawn(useStdbuf ? 'stdbuf' : options.interpreter,
+    useStdbuf ? ['-o0', options.interpreter, options.program] : [options.program],
+    { stdio: ['pipe', 'pipe', 'inherit'] });
+  host = new Host(options);
+  await runProgram(child, host);
+} catch (error) {
+  console.error(`bfa: ${error.message}`);
+  process.exitCode = 1;
+  child?.kill();
+} finally {
+  host?.close();
 }

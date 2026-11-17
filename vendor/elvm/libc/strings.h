@@ -1,4 +1,0 @@
-#ifndef ELVM_LIBC_STRINGS_H_
-#define ELVM_LIBC_STRINGS_H_
-
-#endif  // ELVM_LIBC_STRINGS_H_
